@@ -1,0 +1,35 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
+
+# Logs and temp files
+logs/
+*.log
+*.tmp
+*.swp
+
+# Large local assets and generated outputs
+cache/
+models/
+workspace/
+
+# Local clone of upstream dependency
+repos/
