@@ -2,9 +2,11 @@
 import argparse
 import contextlib
 import importlib
+import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -81,6 +83,11 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         default=None,
         help="Optional CUDA device list, for example `0,1`.",
     )
+    bootstrap.add_argument(
+        "--server-socket",
+        default=None,
+        help="Optional UNIX socket path for a resident Wan inference service. When set, preprocessing runs locally and inference is dispatched to the resident service instead of launching torchrun.",
+    )
 
     base_args, _ = bootstrap.parse_known_args()
     preproccess_name = "vace_preproccess"
@@ -154,7 +161,68 @@ def run_preprocess(repo_dir: Path, args: argparse.Namespace) -> dict[str, object
     return preprocess_output
 
 
+def absolutize_path(value: str, base_dir: Path) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    return str((base_dir / path).resolve())
+
+
+def normalize_inference_payload(repo_dir: Path, payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    for key in ("ckpt_dir", "src_video", "src_mask", "save_dir", "save_file"):
+        value = normalized.get(key)
+        if isinstance(value, str) and value:
+            normalized[key] = absolutize_path(value, repo_dir)
+    src_ref_images = normalized.get("src_ref_images")
+    if isinstance(src_ref_images, str) and src_ref_images:
+        normalized["src_ref_images"] = ",".join(
+            absolutize_path(part, repo_dir) if part else part for part in src_ref_images.split(",")
+        )
+    return normalized
+
+
+def run_inference_via_server(repo_dir: Path, args: argparse.Namespace, preprocess_output: dict[str, object]) -> int:
+    if args.base != "wan":
+        raise ValueError("Resident inference service mode currently supports only the Wan backend.")
+
+    inference_parser = load_parser("vace_wan_inference")
+    inference_args = filter_args(vars(args), inference_parser)
+    inference_args.update(preprocess_output)
+    payload = normalize_inference_payload(repo_dir, inference_args)
+
+    request = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
+    socket_path = args.server_socket
+    if socket_path is None:
+        raise ValueError("server_socket is required for resident service mode.")
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        client.sendall(request)
+        client.shutdown(socket.SHUT_WR)
+
+        response_chunks: list[bytes] = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response_chunks.append(chunk)
+
+    if not response_chunks:
+        raise RuntimeError("Resident inference service closed the connection without a response.")
+
+    response = json.loads(b"".join(response_chunks).decode("utf-8"))
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error", "Resident inference service failed."))
+
+    print("Resident service result:", response.get("result"))
+    return 0
+
+
 def run_inference(repo_dir: Path, args: argparse.Namespace, preprocess_output: dict[str, object]) -> int:
+    if args.server_socket:
+        return run_inference_via_server(repo_dir, args, preprocess_output)
+
     inference_name = "vace_ltx_inference" if args.base == "ltx" else "vace_wan_inference"
     inference_parser = load_parser(inference_name)
     inference_args = filter_args(vars(args), inference_parser)
