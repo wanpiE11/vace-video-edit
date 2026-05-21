@@ -27,7 +27,7 @@ export VACE_MODEL_ROOT="$ROOT_DIR/models"
 export HF_HOME="$ROOT_DIR/cache/hf_home"
 export MODELSCOPE_CACHE="$ROOT_DIR/cache/modelscope"
 export MODELSCOPE_HOME="$ROOT_DIR/cache/modelscope"
-export PYTHONPATH="$REPO_PATH${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT_DIR:$REPO_PATH${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$REPO_PATH"
 
