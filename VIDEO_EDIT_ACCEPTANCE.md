@@ -39,13 +39,19 @@
 
 ## 2. 测试地址
 
-当前机器 IP：
+当前机器 IP 每次重启后可能变化，因此本文档不再写死某一个内网 IP。
 
-- `10.233.70.35`
+建议先在服务器上动态获取当前 IP：
+
+```bash
+hostname -I
+```
+
+如果返回多个地址，默认取第一个内网地址作为联调地址。
 
 建议联调地址：
 
-- `http://10.233.70.35:8880`
+- `http://<当前服务器IP>:8880`
 
 本机地址：
 
@@ -56,15 +62,18 @@
 - 端口固定按当前文档使用 `8880`
 - 启动 API 时请使用 `--host 0.0.0.0`
 - 如果 shell 设置了代理，测试本机或内网地址时建议带 `--noproxy '*'`
+- 建议联调前先执行 `export HOST_IP=$(hostname -I | awk '{print $1}')`
+- 建议后续命令统一使用 `export BASE_URL=http://$HOST_IP:8880`
 
 ## 3. 建议交付方式
 
-建议测试和前端联调统一采用“先预热 engine，再启动 HTTP API”的模式。
+建议测试和前端联调统一采用“先启动 HTTP API，再调用模型加载接口预热 engine”的模式。
 
 原因：
 
 - 更稳定
-- `healthz` 状态更容易观察
+- API 自己知道当前模型加载状态
+- `healthz` 和 `/engine` 状态更容易观察
 - 避免首个任务触发长时间模型加载，影响前端联调体验
 - 更接近后续线上常驻服务形态
 
@@ -79,30 +88,7 @@
 - 默认测试视频存在：`/root/data/gzn/vace-video-edit/workspace/inputs/videos/scene_01_shot_02.mp4`
 - 默认参考图存在：`/root/data/gzn/vace-video-edit/workspace/inputs/images/nezha.png`
 
-### 4.2 启动四卡常驻 engine
-
-在仓库根目录执行：
-
-```bash
-cd /root/data/gzn/vace-video-edit
-source activate_vace.sh
-
-python /root/data/gzn/vace-video-edit/run_edit_video_server.py \
-  --socket-path /tmp/vace_wan_infer.sock \
-  --model_name vace-14B \
-  --ckpt_dir /root/data/gzn/vace-video-edit/models/Wan2.1-VACE-14B \
-  --nproc-per-node 4 \
-  --ulysses_size 4 \
-  --ring_size 1
-```
-
-说明：
-
-- 首次模型加载很慢，等待时间可能较长
-- `/tmp/vace_wan_infer.sock` 出现前，不代表启动失败
-- 进入推理后，4 张卡会长时间高利用率
-
-### 4.3 启动 HTTP API
+### 4.2 启动 HTTP API
 
 另开一个 shell：
 
@@ -116,33 +102,12 @@ python -m uvicorn video_edit_api:app --host 0.0.0.0 --port 8880
 启动后，对外联调地址为：
 
 ```text
-http://10.233.70.35:8880
+http://<当前服务器IP>:8880
 ```
 
-### 4.4 用 tmux 常驻启动
+### 4.3 用 tmux 常驻启动
 
-如果希望退出 SSH 后服务继续运行，建议分别用两个 `tmux` 会话启动 `engine` 和 `API`。
-
-启动四卡常驻 `engine`：
-
-```bash
-tmux new -s vace-engine
-```
-
-进入会话后执行：
-
-```bash
-cd /root/data/gzn/vace-video-edit
-source activate_vace.sh
-
-python /root/data/gzn/vace-video-edit/run_edit_video_server.py \
-  --socket-path /tmp/vace_wan_infer.sock \
-  --model_name vace-14B \
-  --ckpt_dir /root/data/gzn/vace-video-edit/models/Wan2.1-VACE-14B \
-  --nproc-per-node 4 \
-  --ulysses_size 4 \
-  --ring_size 1
-```
+如果希望退出 SSH 后服务继续运行，建议用一个 `tmux` 会话启动 `API`。
 
 启动 HTTP API：
 
@@ -159,6 +124,8 @@ source activate_vace.sh
 python -m uvicorn video_edit_api:app --host 0.0.0.0 --port 8880
 ```
 
+模型加载改由 API 接口触发，不再要求单独常驻启动 `engine`。
+
 只退出 `tmux` 会话但保持进程继续运行：
 
 ```bash
@@ -168,7 +135,6 @@ Ctrl+b d
 重新进入会话：
 
 ```bash
-tmux attach -t vace-engine
 tmux attach -t vace-api
 ```
 
@@ -179,12 +145,6 @@ tmux ls
 ```
 
 ### 4.5 查看是否已经启动
-
-查看 `engine` 进程：
-
-```bash
-ps -ef | grep run_edit_video_server.py | grep -v grep
-```
 
 查看 API 进程：
 
@@ -198,10 +158,10 @@ ps -ef | grep "python -m uvicorn video_edit_api:app" | grep -v grep
 ss -ltnp | grep :8880
 ```
 
-查看 `engine` socket 是否 ready：
+查看 engine 状态：
 
 ```bash
-ls -l /tmp/vace_wan_infer.sock
+curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/engine
 ```
 
 查看 API 健康状态：
@@ -233,21 +193,18 @@ Ctrl+b d
 如果要直接关闭整个 `tmux` 会话：
 
 ```bash
-tmux kill-session -t vace-engine
 tmux kill-session -t vace-api
 ```
 
 如果要按进程名终止：
 
 ```bash
-pkill -f run_edit_video_server.py
 pkill -f "python -m uvicorn video_edit_api:app"
 ```
 
 如果普通终止没有生效，再强制终止：
 
 ```bash
-pkill -9 -f run_edit_video_server.py
 pkill -9 -f "python -m uvicorn video_edit_api:app"
 ```
 
@@ -255,7 +212,7 @@ pkill -9 -f "python -m uvicorn video_edit_api:app"
 
 - 优先使用 `Ctrl+C` 或 `pkill -f`，避免直接强杀。
 - 强制终止会直接打断当前推理中的任务。
-- 当前服务没有“取消单个任务”接口；停掉 API 或 engine 会影响当前内存里的全部任务。
+- 当前服务没有“取消单个任务”接口；停掉 API 会影响当前内存里的全部任务，并中断它所管理的 engine。
 
 ## 5. 调用说明
 
@@ -265,27 +222,61 @@ pkill -9 -f "python -m uvicorn video_edit_api:app"
 
 ### 5.1 健康检查
 
+先设置联调基地址：
+
 ```bash
-curl --noproxy '*' http://10.233.70.35:8880/healthz
+export HOST_IP=$(hostname -I | awk '{print $1}')
+export BASE_URL=http://$HOST_IP:8880
+```
+
+```bash
+curl --noproxy '*' "$BASE_URL/healthz"
 ```
 
 期望：
 
 - HTTP `200`
 - `ok=true`
-- `engine_state` 为 `ready` 或 `busy`
+- 建任务前允许 `engine_state=stopped`
 
-### 5.2 创建任务
+### 5.2 触发模型加载
+
+```bash
+curl --noproxy '*' -X POST "$BASE_URL/api/v1/video-editing/engine/load"
+```
+
+期望：
+
+- 首次返回 HTTP `202`
+- 返回 `state`
+- 返回 `phase`
+- 返回 `progress`
+- 返回 `status_url`
+
+### 5.3 轮询 engine 状态
+
+```bash
+curl --noproxy '*' "$BASE_URL/api/v1/video-editing/engine"
+```
+
+期望：
+
+- 最终 `state=ready`
+- `phase=ready`
+- `progress=1.0`
+- `ready_at` 非空
+
+### 5.4 创建任务
 
 ```bash
 curl --noproxy '*' \
-  -X POST http://10.233.70.35:8880/api/v1/video-editing/jobs \
+  -X POST "$BASE_URL/api/v1/video-editing/jobs" \
   -H 'Content-Type: application/json' \
   -d '{
     "workspace_id": "frontend_integration",
     "video_path": "/root/data/gzn/vace-video-edit/workspace/inputs/videos/scene_01_shot_02.mp4",
     "reference_image_path": "/root/data/gzn/vace-video-edit/workspace/inputs/images/nezha.png",
-    "prompt": "将框选区域中的人物替换成哪吒，保持背景、镜头运动和其他区域不变",
+    "prompt": "镜头中的人物改成参考图的人物，其他不变",
     "bbox": [421, 0, 826, 535],
     "output_name": "frontend_integration.mp4",
     "resolution": "480p",
@@ -303,11 +294,11 @@ curl --noproxy '*' \
 - 返回 `results_url`
 - 返回 `output_download_url`
 
-### 5.3 轮询任务状态
+### 5.5 轮询任务状态
 
 ```bash
 curl --noproxy '*' \
-  http://10.233.70.35:8880/api/v1/video-editing/jobs/<job_id>
+  "$BASE_URL/api/v1/video-editing/jobs/<job_id>"
 ```
 
 期望：
@@ -316,11 +307,11 @@ curl --noproxy '*' \
 - 完成后状态为 `done`
 - 完成后 `output.output_video_path` 非空
 
-### 5.4 未完成时取结果
+### 5.6 未完成时取结果
 
 ```bash
 curl --noproxy '*' \
-  http://10.233.70.35:8880/api/v1/video-editing/jobs/<job_id>/results
+  "$BASE_URL/api/v1/video-editing/jobs/<job_id>/results"
 ```
 
 期望：
@@ -328,11 +319,11 @@ curl --noproxy '*' \
 - 若任务尚未完成，返回 HTTP `409`
 - 错误码为 `JOB_NOT_COMPLETED`
 
-### 5.5 获取结果
+### 5.7 获取结果
 
 ```bash
 curl --noproxy '*' \
-  http://10.233.70.35:8880/api/v1/video-editing/jobs/<job_id>/results
+  "$BASE_URL/api/v1/video-editing/jobs/<job_id>/results"
 ```
 
 期望：
@@ -344,11 +335,11 @@ curl --noproxy '*' \
 - 返回 `src_mask_path`
 - 返回 `src_ref_image_paths`
 
-### 5.6 下载输出视频
+### 5.8 下载输出视频
 
 ```bash
 curl --noproxy '*' -OJ \
-  http://10.233.70.35:8880/api/v1/video-editing/jobs/<job_id>/output/download
+  "$BASE_URL/api/v1/video-editing/jobs/<job_id>/output/download"
 ```
 
 期望：
@@ -419,7 +410,7 @@ curl --noproxy '*' -OJ \
 
 - 只支持服务器本地绝对路径输入，不支持直接上传文件
 - 任务进度当前只有粗粒度状态，`running` 时 `progress` 目前固定为中间值，不是细粒度采样进度
-- 首次模型加载很慢，不适合把“自动拉起 engine”作为日常联调模式
+- 首次模型加载很慢，建议先调用 `/api/v1/video-editing/engine/load`，待 `ready` 后再提任务
 - 四卡推理对 GPU 资源要求高，联调期间不建议与其他重任务混跑
 
 ## 10. 文档使用方式
@@ -431,6 +422,6 @@ curl --noproxy '*' -OJ \
 - `VIDEO_EDIT_ACCEPTANCE.md`
   作为交付、测试、联调、验收说明
 - `four_gpu_vace_command.md`
-  作为四卡常驻 engine 启动手册
+  作为底层 engine 启动与排障参考，不是默认联调主流程
 
 如果测试同事完成本文档第 8 节中的验收项，就可以通知前端按 `VideoEditAPI.md` 的接口契约合入。 

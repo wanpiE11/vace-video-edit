@@ -5,10 +5,17 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Virtual environments
 .venv/
 venv/
+.python-version
 
 # Editor and OS noise
 .DS_Store
@@ -25,11 +32,13 @@ logs/
 *.log
 *.tmp
 *.swp
+tmp/
 
 # Large local assets and generated outputs
 cache/
 models/
 workspace/
+frontend_integration.mp4
 
 # Local clone of upstream dependency
 repos/

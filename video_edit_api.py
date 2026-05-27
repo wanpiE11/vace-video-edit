@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -105,12 +105,35 @@ def create_app(service: VideoEditService | None = None) -> FastAPI:
                     "device_mode": snapshot.device_mode,
                     "current_job_id": snapshot.current_job_id,
                     "started_at": snapshot.started_at,
+                    "phase": snapshot.phase,
+                    "progress": snapshot.progress,
                 },
                 "queue": {
                     "pending": snapshot.pending_jobs,
                 },
             },
         }
+
+    @app.post("/api/v1/video-editing/engine/load")
+    async def load_engine(
+        response: Response,
+        edit_service: VideoEditService = Depends(_get_service),
+    ) -> dict[str, object]:
+        result = edit_service.request_model_load()
+        response.status_code = 202 if result.accepted else 200
+        return {
+            "ok": True,
+            "data": {
+                **_serialize_engine(result.snapshot),
+                "status_url": _engine_status_url(),
+            },
+        }
+
+    @app.get("/api/v1/video-editing/engine")
+    async def get_engine(
+        edit_service: VideoEditService = Depends(_get_service),
+    ) -> dict[str, object]:
+        return {"ok": True, "data": _serialize_engine(edit_service.get_engine_state())}
 
     @app.post("/api/v1/video-editing/jobs", status_code=202)
     async def create_job(
@@ -198,6 +221,10 @@ def _serialize_job(job: JobRecord, service: VideoEditService) -> dict[str, objec
     }
 
 
+def _serialize_engine(snapshot: EngineStateSnapshot) -> dict[str, object]:
+    return snapshot.to_dict()
+
+
 def _serialize_output(job_id: str, output: JobOutput) -> dict[str, object]:
     return {
         "output_dir": output.output_dir,
@@ -219,6 +246,10 @@ def _job_results_url(job_id: str) -> str:
 
 def _job_download_url(job_id: str) -> str:
     return f"/api/v1/video-editing/jobs/{job_id}/output/download"
+
+
+def _engine_status_url() -> str:
+    return "/api/v1/video-editing/engine"
 
 
 def _status_code_for_service_error(code: str) -> int:

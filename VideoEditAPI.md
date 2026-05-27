@@ -6,7 +6,7 @@ Base URL: `http://<host>:8880`
 内部实现约束同时固定如下：
 
 - 服务端自动管理常驻四卡 VACE engine
-- 首次请求可触发 engine 启动
+- 通过独立接口触发并跟踪 engine 模型加载
 - engine 未 ready 时请求进入等待或排队
 - 默认任务策略固定为 `task=swap_anything`
 - 默认参考图含背景，固定使用 `mode=bboxtrack,salient`
@@ -17,6 +17,8 @@ Base URL: `http://<host>:8880`
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/healthz` | 健康检查 |
+| `POST` | `/api/v1/video-editing/engine/load` | 触发默认模型预加载 |
+| `GET` | `/api/v1/video-editing/engine` | 查询 engine 加载状态 |
 | `POST` | `/api/v1/video-editing/jobs` | 创建异步视频编辑任务 |
 | `GET` | `/api/v1/video-editing/jobs/{job_id}` | 查询任务状态 |
 | `GET` | `/api/v1/video-editing/jobs/{job_id}/results` | 获取任务结果 |
@@ -67,6 +69,15 @@ Base URL: `http://<host>:8880`
 - `starting`
 - `ready`
 - `busy`
+- `failed`
+
+#### engine_phase
+
+- `not_initialized`
+- `spawning_daemon`
+- `model_initialized`
+- `ready`
+- `running_job`
 - `failed`
 
 #### job_status
@@ -190,15 +201,81 @@ Base URL: `http://<host>:8880`
 | `output` | `object` | 任务输出摘要 |
 | `error` | `object \| null` | 失败时错误信息 |
 
-## 5. 健康检查
+## 5. Engine 加载与状态
 
-### 5.1 请求
+### 5.1 触发模型加载
+
+```http
+POST /api/v1/video-editing/engine/load
+```
+
+说明：
+
+- 不需要请求体
+- 固定加载当前服务默认配置的模型
+- 幂等
+- `stopped` 或 `failed` 进入新一轮加载时返回 `202 Accepted`
+- `starting`、`ready`、`busy` 时返回 `200 OK`
+
+成功返回示例：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "state": "starting",
+    "phase": "spawning_daemon",
+    "progress": 0.2,
+    "current_job_id": null,
+    "pending_jobs": 0,
+    "last_error": null,
+    "started_at": null,
+    "load_requested_at": "2026-05-21T10:00:00Z",
+    "ready_at": null,
+    "model_name": "vace-14B",
+    "device_mode": "4gpu",
+    "status_url": "/api/v1/video-editing/engine"
+  }
+}
+```
+
+### 5.2 查询 engine 状态
+
+```http
+GET /api/v1/video-editing/engine
+```
+
+字段说明：
+
+| 字段 | 说明 |
+|---|---|
+| `state` | `stopped` / `starting` / `ready` / `busy` / `failed` |
+| `phase` | `not_initialized` / `spawning_daemon` / `model_initialized` / `ready` / `running_job` / `failed` |
+| `progress` | 阶段型进度：`0.0 / 0.2 / 0.8 / 1.0` |
+| `model_name` | 当前默认模型名 |
+| `device_mode` | 当前设备模式 |
+| `current_job_id` | 当前运行中的任务 ID |
+| `pending_jobs` | 排队中任务数，不含当前运行任务 |
+| `load_requested_at` | 本轮加载请求时间 |
+| `ready_at` | engine ready 时间 |
+| `last_error` | 最近一次加载失败信息 |
+
+进度语义：
+
+- `stopped` -> `0.0`
+- `spawning_daemon` -> `0.2`
+- `model_initialized` -> `0.8`
+- `ready` / `running_job` -> `1.0`
+
+## 6. 健康检查
+
+### 6.1 请求
 
 ```http
 GET /healthz
 ```
 
-### 5.2 成功返回
+### 6.2 成功返回
 
 ```json
 {
@@ -210,7 +287,9 @@ GET /healthz
       "model_name": "vace-14B",
       "device_mode": "4gpu",
       "current_job_id": null,
-      "started_at": "2026-05-19T19:00:03Z"
+      "started_at": "2026-05-19T19:00:03Z",
+      "phase": "ready",
+      "progress": 1.0
     },
     "queue": {
       "pending": 0
@@ -219,25 +298,28 @@ GET /healthz
 }
 ```
 
-### 5.3 字段说明
+### 6.3 字段说明
 
 | 字段 | 说明 |
 |---|---|
 | `status` | API 存活状态，固定 `ok` |
 | `engine_state` | `stopped` / `starting` / `ready` / `busy` / `failed` |
 | `engine.current_job_id` | 当前执行中的任务 ID |
+| `engine.phase` | engine 当前阶段 |
+| `engine.progress` | engine 阶段型进度 |
+| `engine.started_at` | engine ready 时间，兼容旧字段 |
 | `queue.pending` | 排队中任务数，不含当前运行任务 |
 
-## 6. 创建任务
+## 7. 创建任务
 
-### 6.1 请求
+### 7.1 请求
 
 ```http
 POST /api/v1/video-editing/jobs
 Content-Type: application/json
 ```
 
-### 6.2 请求示例
+### 7.2 请求示例
 
 ```json
 {
@@ -254,7 +336,7 @@ Content-Type: application/json
 }
 ```
 
-### 6.3 成功返回
+### 7.3 成功返回
 
 HTTP 状态码：`202 Accepted`
 
@@ -273,7 +355,7 @@ HTTP 状态码：`202 Accepted`
 }
 ```
 
-### 6.4 返回字段
+### 7.4 返回字段
 
 | 字段 | 说明 |
 |---|---|
@@ -579,25 +661,20 @@ python -m uvicorn video_edit_api:app --host 0.0.0.0 --port 8880
 
 - `http://127.0.0.1:8880`
 
-### 16.2 两种真机测试模式
+### 16.2 推荐真机测试模式
 
-#### 模式 A：先预热 engine，再测 HTTP API
+标准流程改为由 HTTP API 自己触发并跟踪模型加载：
 
-适合先确认接口协议、状态码和输出回填是否正常。
-
-- 先按 [four_gpu_vace_command.md](/root/data/gzn/vace-video-edit/four_gpu_vace_command.md) 单独启动 `run_edit_video_server.py`
-- 等待 `/tmp/vace_wan_infer.sock` ready
-- 再启动 `video_edit_api:app`
-- 此时 `GET /healthz` 预期为 `ready` 或 `busy`
-
-#### 模式 B：直接测自动拉起
-
-适合确认“首次请求自动拉起四卡 engine”这条真实链路。
-
-- 不手动启动 `run_edit_video_server.py`
 - 只启动 `video_edit_api:app`
-- 用第一次 `POST /api/v1/video-editing/jobs` 触发 engine 启动
-- 此时 `GET /healthz` 允许经历 `stopped -> starting -> ready/busy`
+- 调用 `POST /api/v1/video-editing/engine/load`
+- 轮询 `GET /api/v1/video-editing/engine`，直到 `state=ready`
+- 再调用 `POST /api/v1/video-editing/jobs`
+
+说明：
+
+- 旧的“手动单独启动 `run_edit_video_server.py`”不再是主流程
+- 当前版本只保证跟踪由 API 进程自己触发的加载
+- `starting` 期间创建任务仍会排队等待，不会失败快返
 
 ## 17. 真机接口验收
 
@@ -636,10 +713,33 @@ curl --noproxy '*' http://127.0.0.1:8880/healthz
 
 - 返回 `200`
 - `ok=true`
-- 预热模式下 `engine_state` 为 `ready` 或 `busy`
-- 自动拉起模式下，建任务前允许为 `stopped`
+- 建任务前允许 `engine_state=stopped`
 
-#### 第二步：创建真实任务
+#### 第二步：触发模型加载
+
+```bash
+curl --noproxy '*' -X POST http://127.0.0.1:8880/api/v1/video-editing/engine/load
+```
+
+通过标准：
+
+- 首次返回 `202`
+- 返回体包含 `state`、`phase`、`progress`、`status_url`
+
+#### 第三步：轮询 engine ready
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/engine
+```
+
+通过标准：
+
+- 最终 `state=ready`
+- `phase=ready`
+- `progress=1.0`
+- `ready_at` 非空
+
+#### 第四步：创建真实任务
 
 ```bash
 curl --noproxy '*' \
@@ -663,7 +763,7 @@ curl --noproxy '*' \
 - 返回体含 `job_id`
 - 返回体含 `status_url` / `results_url` / `output_download_url`
 
-#### 第三步：未完成时取结果
+#### 第五步：未完成时取结果
 
 ```bash
 curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/jobs/<job_id>/results
@@ -674,7 +774,7 @@ curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/jobs/<job_id>/resu
 - 若任务尚未完成，返回 `409`
 - 错误码为 `JOB_NOT_COMPLETED`
 
-#### 第四步：轮询任务状态
+#### 第六步：轮询任务状态
 
 ```bash
 curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/jobs/<job_id>
@@ -686,7 +786,7 @@ curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/jobs/<job_id>
 - 完成后 `output.output_video_path` 非空
 - 失败时 `error.code` 与 `error.message` 非空
 
-#### 第五步：获取结果和下载视频
+#### 第七步：获取结果和下载视频
 
 ```bash
 curl --noproxy '*' http://127.0.0.1:8880/api/v1/video-editing/jobs/<job_id>/results

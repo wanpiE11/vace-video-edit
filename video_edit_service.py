@@ -5,6 +5,7 @@ import ast
 import json
 import os
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -30,7 +31,7 @@ DEFAULT_MODE = "bboxtrack,salient"
 DEFAULT_OUTPUT_NAME = "out_video.mp4"
 DEFAULT_WORKSPACE_ID = "default"
 DEVICE_MODE = "4gpu"
-ENGINE_START_TIMEOUT_SECONDS = 900.0
+ENGINE_START_TIMEOUT_SECONDS = float(os.environ.get("VIDEO_EDIT_ENGINE_START_TIMEOUT_SECONDS", "3600"))
 ENGINE_POLL_INTERVAL_SECONDS = 1.0
 ALLOWED_RESOLUTIONS = {"480p", "720p", "source"}
 PROGRESS_QUEUED = 0.0
@@ -123,22 +124,45 @@ class SubmitJobResult:
 
 
 @dataclass
+class ModelLoadRequestResult:
+    accepted: bool
+    snapshot: "EngineStateSnapshot"
+
+
+class EnginePhase:
+    NOT_INITIALIZED = "not_initialized"
+    SPAWNING_DAEMON = "spawning_daemon"
+    MODEL_INITIALIZED = "model_initialized"
+    READY = "ready"
+    RUNNING_JOB = "running_job"
+    FAILED = "failed"
+
+
+@dataclass
 class EngineStateSnapshot:
     state: str
+    phase: str
+    progress: float
     current_job_id: str | None
     pending_jobs: int
     last_error: JobError | None
     started_at: str | None
+    load_requested_at: str | None
+    ready_at: str | None
     model_name: str
     device_mode: str
 
     def to_dict(self) -> dict[str, object]:
         return {
             "state": self.state,
+            "phase": self.phase,
+            "progress": self.progress,
             "current_job_id": self.current_job_id,
             "pending_jobs": self.pending_jobs,
             "last_error": None if self.last_error is None else self.last_error.to_dict(),
             "started_at": self.started_at,
+            "load_requested_at": self.load_requested_at,
+            "ready_at": self.ready_at,
             "model_name": self.model_name,
             "device_mode": self.device_mode,
         }
@@ -187,11 +211,15 @@ class VideoEditService:
         self._pending_job_ids: list[str] = []
         self._condition = threading.Condition()
         self._engine_state = EngineState.STOPPED
+        self._engine_phase = EnginePhase.NOT_INITIALIZED
+        self._engine_progress = 0.0
         self._engine_error: JobError | None = None
-        self._engine_started_at: str | None = None
+        self._engine_load_requested_at: str | None = None
+        self._engine_ready_at: str | None = None
         self._current_job_id: str | None = None
         self._daemon_process: subprocess.Popen | None = None
         self._daemon_log_handle = None
+        self._startup_generation = 0
         self._closed = False
 
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -238,7 +266,7 @@ class VideoEditService:
             if isinstance(client_request_id, str) and client_request_id:
                 self._job_request_signatures[client_request_id] = job_id
 
-        self._ensure_engine_started()
+        self.request_model_load()
         self._queue.put(job_id)
 
         with self._condition:
@@ -267,15 +295,78 @@ class VideoEditService:
 
     def get_engine_state(self) -> EngineStateSnapshot:
         with self._condition:
-            return EngineStateSnapshot(
-                state=self._engine_state,
-                current_job_id=self._current_job_id,
-                pending_jobs=len(self._pending_job_ids),
-                last_error=self._engine_error,
-                started_at=self._engine_started_at,
-                model_name=self.model_name,
-                device_mode=DEVICE_MODE,
+            return self._engine_snapshot_unlocked()
+
+    def request_model_load(self) -> ModelLoadRequestResult:
+        spawn_daemon = False
+        log_path: Path | None = None
+        log_offset = 0
+        generation = 0
+
+        with self._condition:
+            self._ensure_open()
+            if self._engine_state in {EngineState.STARTING, EngineState.READY, EngineState.BUSY}:
+                return ModelLoadRequestResult(accepted=False, snapshot=self._engine_snapshot_unlocked())
+
+            self._engine_state = EngineState.STARTING
+            self._engine_phase = EnginePhase.SPAWNING_DAEMON
+            self._engine_progress = 0.2
+            self._engine_error = None
+            self._engine_load_requested_at = self._utc_now()
+            self._engine_ready_at = None
+            self._startup_generation += 1
+            generation = self._startup_generation
+            self._condition.notify_all()
+            spawn_daemon = True
+
+        if spawn_daemon:
+            try:
+                process, log_handle, log_path, log_offset = self._spawn_daemon_process()
+            except Exception as exc:
+                self._set_engine_failed(
+                    code="ENGINE_START_FAILED",
+                    message=f"Failed to spawn resident daemon: {exc}",
+                    trace=traceback.format_exc(),
+                )
+                return ModelLoadRequestResult(accepted=True, snapshot=self.get_engine_state())
+
+            with self._condition:
+                self._daemon_process = process
+                self._daemon_log_handle = log_handle
+                self._condition.notify_all()
+
+            watcher = threading.Thread(
+                target=self._watch_engine_startup,
+                args=(generation,),
+                name="video-edit-engine-startup",
+                daemon=True,
             )
+            watcher.start()
+            if log_path is not None:
+                log_watcher = threading.Thread(
+                    target=self._watch_engine_logs,
+                    args=(generation, log_path, log_offset),
+                    name="video-edit-engine-log-watch",
+                    daemon=True,
+                )
+                log_watcher.start()
+
+        return ModelLoadRequestResult(accepted=True, snapshot=self.get_engine_state())
+
+    def _engine_snapshot_unlocked(self) -> EngineStateSnapshot:
+        return EngineStateSnapshot(
+            state=self._engine_state,
+            phase=self._engine_phase,
+            progress=self._engine_progress,
+            current_job_id=self._current_job_id,
+            pending_jobs=len(self._pending_job_ids),
+            last_error=self._engine_error,
+            started_at=self._engine_ready_at,
+            load_requested_at=self._engine_load_requested_at,
+            ready_at=self._engine_ready_at,
+            model_name=self.model_name,
+            device_mode=DEVICE_MODE,
+        )
 
     def close(self) -> None:
         with self._condition:
@@ -291,42 +382,12 @@ class VideoEditService:
         if self._closed:
             raise RuntimeError("VideoEditService is closed.")
 
-    def _ensure_engine_started(self) -> None:
-        spawn_daemon = False
-        with self._condition:
-            if self._engine_state in {EngineState.STARTING, EngineState.READY, EngineState.BUSY}:
-                return
-            self._engine_state = EngineState.STARTING
-            self._engine_error = None
-            self._condition.notify_all()
-            spawn_daemon = True
-
-        if not spawn_daemon:
-            return
-
-        try:
-            process, log_handle = self._spawn_daemon_process()
-        except Exception as exc:
-            self._set_engine_failed(
-                code="ENGINE_START_FAILED",
-                message=f"Failed to spawn resident daemon: {exc}",
-                trace=traceback.format_exc(),
-            )
-            return
-
-        with self._condition:
-            self._daemon_process = process
-            self._daemon_log_handle = log_handle
-            self._condition.notify_all()
-
-        watcher = threading.Thread(target=self._watch_engine_startup, name="video-edit-engine-startup", daemon=True)
-        watcher.start()
-
-    def _spawn_daemon_process(self) -> tuple[subprocess.Popen, object]:
+    def _spawn_daemon_process(self) -> tuple[subprocess.Popen, object, Path, int]:
         logs_dir = self.repo_root / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / "video_edit_engine.log"
         log_handle = log_path.open("a", encoding="utf-8")
+        log_offset = log_handle.tell()
 
         cmd = [
             sys.executable,
@@ -354,10 +415,11 @@ class VideoEditService:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
-        return process, log_handle
+        return process, log_handle, log_path, log_offset
 
-    def _watch_engine_startup(self) -> None:
+    def _watch_engine_startup(self, generation: int) -> None:
         deadline = time.monotonic() + self.startup_timeout_seconds
         while time.monotonic() < deadline:
             with self._condition:
@@ -365,8 +427,9 @@ class VideoEditService:
                     return
                 process = self._daemon_process
                 state = self._engine_state
+                current_generation = self._startup_generation
 
-            if process is None or state != EngineState.STARTING:
+            if process is None or state != EngineState.STARTING or current_generation != generation:
                 return
 
             return_code = process.poll()
@@ -380,9 +443,12 @@ class VideoEditService:
 
             if self.socket_probe(self.socket_path):
                 with self._condition:
-                    if self._engine_state == EngineState.STARTING:
+                    if self._engine_state == EngineState.STARTING and self._startup_generation == generation:
                         self._engine_state = EngineState.READY
-                        self._engine_started_at = self._utc_now()
+                        self._engine_phase = EnginePhase.READY
+                        self._engine_progress = 1.0
+                        self._engine_ready_at = self._utc_now()
+                        self._engine_error = None
                         self._condition.notify_all()
                 return
 
@@ -397,9 +463,34 @@ class VideoEditService:
     def _set_engine_failed(self, code: str, message: str, trace: str) -> None:
         with self._condition:
             self._engine_state = EngineState.FAILED
+            self._engine_phase = EnginePhase.FAILED
             self._engine_error = JobError(code=code, message=message, traceback=trace)
             self._condition.notify_all()
         self._stop_daemon_process()
+
+    def _watch_engine_logs(self, generation: int, log_path: Path, offset: int) -> None:
+        with log_path.open("r", encoding="utf-8") as log_file:
+            log_file.seek(offset)
+            while True:
+                with self._condition:
+                    if self._closed or self._startup_generation != generation or self._engine_state != EngineState.STARTING:
+                        return
+
+                line = log_file.readline()
+                if not line:
+                    time.sleep(self.poll_interval_seconds)
+                    continue
+
+                if "Inference model is initialized" not in line:
+                    continue
+
+                with self._condition:
+                    if self._startup_generation != generation or self._engine_state != EngineState.STARTING:
+                        return
+                    self._engine_phase = EnginePhase.MODEL_INITIALIZED
+                    self._engine_progress = 0.8
+                    self._condition.notify_all()
+                return
 
     def _worker_loop(self) -> None:
         while True:
@@ -431,6 +522,8 @@ class VideoEditService:
                     self._current_job_id = None
                     process_alive = self._daemon_process is not None and self._daemon_process.poll() is None
                     self._engine_state = EngineState.READY if process_alive else EngineState.FAILED
+                    self._engine_phase = EnginePhase.READY if process_alive else EnginePhase.FAILED
+                    self._engine_progress = 1.0
                     if not process_alive and self._engine_error is None:
                         self._engine_error = JobError(
                             code="ENGINE_NOT_READY",
@@ -458,7 +551,7 @@ class VideoEditService:
                     )
                 continue
             if state == EngineState.STOPPED:
-                self._ensure_engine_started()
+                self.request_model_load()
                 continue
 
             error = engine_error or JobError(
@@ -477,6 +570,8 @@ class VideoEditService:
             self._remove_pending_job_unlocked(job.job_id)
             self._current_job_id = job.job_id
             self._engine_state = EngineState.BUSY
+            self._engine_phase = EnginePhase.RUNNING_JOB
+            self._engine_progress = 1.0
             self._condition.notify_all()
 
     def _mark_job_done(self, job: JobRecord, result: JobExecutionResult) -> None:
@@ -643,15 +738,37 @@ class VideoEditService:
         self._daemon_log_handle = None
 
         if process is not None and process.poll() is None:
-            process.terminate()
+            self._terminate_process_tree(process)
             try:
                 process.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                process.kill()
+                self._kill_process_tree(process)
                 process.wait(timeout=5.0)
 
         if log_handle is not None:
             log_handle.close()
+
+    def _terminate_process_tree(self, process: subprocess.Popen) -> None:
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            process.terminate()
+            return
+
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            process.terminate()
+
+    def _kill_process_tree(self, process: subprocess.Popen) -> None:
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            process.kill()
+            return
+
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except OSError:
+            process.kill()
 
     def _validate_payload(self, payload: dict[str, object]) -> dict[str, object]:
         normalized: dict[str, object] = {}

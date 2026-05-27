@@ -9,7 +9,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from video_edit_api import create_app
-from video_edit_service import JobExecutionResult, JobStatus, VideoEditService
+from video_edit_service import EnginePhase, JobExecutionResult, JobStatus, VideoEditService
 
 
 class FakeDaemonProcess:
@@ -133,8 +133,80 @@ class VideoEditApiTests(unittest.TestCase):
                 self.assertEqual(data["engine"]["model_name"], "vace-14B")
                 self.assertEqual(data["engine"]["device_mode"], "4gpu")
                 self.assertIsNotNone(data["engine"]["started_at"])
+                self.assertEqual(data["engine"]["phase"], "running_job")
+                self.assertEqual(data["engine"]["progress"], 1.0)
         finally:
             block.set()
+            service.close()
+
+    def test_engine_load_endpoint_is_idempotent(self) -> None:
+        ready_event = threading.Event()
+
+        def fake_popen(*args, **kwargs):
+            return FakeDaemonProcess()
+
+        def fake_probe(_socket_path: str) -> bool:
+            return ready_event.is_set()
+
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=fake_popen,
+            socket_probe=fake_probe,
+            job_executor=lambda _job: None,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=1.0,
+        )
+        try:
+            app = create_app(service=service)
+            with TestClient(app) as client:
+                first = client.post("/api/v1/video-editing/engine/load")
+                self.assertEqual(first.status_code, 202)
+                self.assertEqual(first.json()["data"]["state"], "starting")
+                self.assertEqual(first.json()["data"]["phase"], "spawning_daemon")
+                self.assertEqual(first.json()["data"]["progress"], 0.2)
+                self.assertEqual(first.json()["data"]["status_url"], "/api/v1/video-editing/engine")
+
+                second = client.post("/api/v1/video-editing/engine/load")
+                self.assertEqual(second.status_code, 200)
+                self.assertEqual(second.json()["data"]["state"], "starting")
+
+                ready_event.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    engine = client.get("/api/v1/video-editing/engine").json()["data"]
+                    if engine["state"] == "ready":
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("engine did not become ready")
+
+                self.assertEqual(engine["phase"], "ready")
+                self.assertEqual(engine["progress"], 1.0)
+                self.assertIsNotNone(engine["ready_at"])
+                self.assertEqual(engine["started_at"], engine["ready_at"])
+        finally:
+            service.close()
+
+    def test_get_engine_returns_complete_snapshot(self) -> None:
+        service = self._make_service()
+        try:
+            app = create_app(service=service)
+            with TestClient(app) as client:
+                response = client.get("/api/v1/video-editing/engine")
+                self.assertEqual(response.status_code, 200)
+                data = response.json()["data"]
+                self.assertEqual(data["state"], "stopped")
+                self.assertEqual(data["phase"], EnginePhase.NOT_INITIALIZED)
+                self.assertEqual(data["progress"], 0.0)
+                self.assertEqual(data["model_name"], "vace-14B")
+                self.assertEqual(data["device_mode"], "4gpu")
+                self.assertIsNone(data["current_job_id"])
+                self.assertEqual(data["pending_jobs"], 0)
+                self.assertIsNone(data["load_requested_at"])
+                self.assertIsNone(data["ready_at"])
+                self.assertIsNone(data["last_error"])
+        finally:
             service.close()
 
     def test_create_job_supports_idempotency(self) -> None:

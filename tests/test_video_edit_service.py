@@ -3,17 +3,26 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
 
-from video_edit_service import EngineState, JobExecutionResult, JobStatus, VideoEditService, VideoEditServiceError
+from video_edit_service import (
+    EnginePhase,
+    EngineState,
+    JobExecutionResult,
+    JobStatus,
+    VideoEditService,
+    VideoEditServiceError,
+)
 
 
 class FakeDaemonProcess:
     def __init__(self) -> None:
         self.returncode = None
         self.terminated = False
+        self.pid = 12345
 
     def poll(self):
         return self.returncode
@@ -67,6 +76,151 @@ class VideoEditServiceTests(unittest.TestCase):
             time.sleep(0.02)
         job = service.get_job(job_id)
         self.fail(f"job {job_id} did not reach status {expected}; last state={None if job is None else job.status}")
+
+    def _wait_for_engine_state(self, service: VideoEditService, expected: str, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snapshot = service.get_engine_state()
+            if snapshot.state == expected:
+                return snapshot
+            time.sleep(0.02)
+        snapshot = service.get_engine_state()
+        self.fail(f"engine did not reach state {expected}; last state={snapshot.state}")
+
+    def _wait_for_engine_phase(self, service: VideoEditService, expected: str, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snapshot = service.get_engine_state()
+            if snapshot.phase == expected:
+                return snapshot
+            time.sleep(0.02)
+        snapshot = service.get_engine_state()
+        self.fail(f"engine did not reach phase {expected}; last phase={snapshot.phase}")
+
+    def test_request_model_load_is_idempotent_until_ready(self) -> None:
+        spawn_count = 0
+        ready_event = threading.Event()
+
+        def fake_popen(*args, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            return FakeDaemonProcess()
+
+        def fake_probe(_socket_path: str) -> bool:
+            return ready_event.is_set()
+
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=fake_popen,
+            socket_probe=fake_probe,
+            job_executor=lambda _job: None,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=1.0,
+        )
+        try:
+            first = service.request_model_load()
+            second = service.request_model_load()
+
+            self.assertTrue(first.accepted)
+            self.assertFalse(second.accepted)
+            self.assertEqual(spawn_count, 1)
+
+            snapshot = service.get_engine_state()
+            self.assertEqual(snapshot.state, EngineState.STARTING)
+            self.assertEqual(snapshot.phase, EnginePhase.SPAWNING_DAEMON)
+            self.assertEqual(snapshot.progress, 0.2)
+            self.assertIsNotNone(snapshot.load_requested_at)
+            self.assertIsNone(snapshot.ready_at)
+
+            ready_event.set()
+            ready_snapshot = self._wait_for_engine_state(service, EngineState.READY)
+            self.assertEqual(ready_snapshot.phase, EnginePhase.READY)
+            self.assertEqual(ready_snapshot.progress, 1.0)
+            self.assertIsNotNone(ready_snapshot.ready_at)
+            self.assertEqual(ready_snapshot.started_at, ready_snapshot.ready_at)
+        finally:
+            service.close()
+
+    def test_log_observer_updates_model_initialized_phase(self) -> None:
+        ready_event = threading.Event()
+
+        def fake_popen(*args, **kwargs):
+            return FakeDaemonProcess()
+
+        def fake_probe(_socket_path: str) -> bool:
+            return ready_event.is_set()
+
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=fake_popen,
+            socket_probe=fake_probe,
+            job_executor=lambda _job: None,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=1.0,
+        )
+        try:
+            service.request_model_load()
+            log_path = self.root / "logs" / "video_edit_engine.log"
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write("Inference model is initialized\n")
+                log_file.flush()
+
+            initialized_snapshot = self._wait_for_engine_phase(service, EnginePhase.MODEL_INITIALIZED)
+            self.assertEqual(initialized_snapshot.progress, 0.8)
+            self.assertEqual(initialized_snapshot.state, EngineState.STARTING)
+
+            ready_event.set()
+            ready_snapshot = self._wait_for_engine_state(service, EngineState.READY)
+            self.assertEqual(ready_snapshot.phase, EnginePhase.READY)
+            self.assertEqual(ready_snapshot.progress, 1.0)
+        finally:
+            service.close()
+
+    def test_failed_load_can_be_retried(self) -> None:
+        spawn_count = 0
+        ready_event = threading.Event()
+
+        def fake_popen(*args, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            process = FakeDaemonProcess()
+            if spawn_count == 1:
+                process.returncode = 3
+            return process
+
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=fake_popen,
+            socket_probe=lambda _socket_path: ready_event.is_set(),
+            job_executor=lambda _job: None,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=1.0,
+        )
+        try:
+            first = service.request_model_load()
+            failed_snapshot = self._wait_for_engine_state(service, EngineState.FAILED)
+
+            self.assertTrue(first.accepted)
+            self.assertEqual(failed_snapshot.phase, EnginePhase.FAILED)
+            self.assertIsNotNone(failed_snapshot.last_error)
+            self.assertEqual(spawn_count, 1)
+
+            second = service.request_model_load()
+            self.assertTrue(second.accepted)
+            self.assertEqual(spawn_count, 2)
+
+            retry_snapshot = self._wait_for_engine_phase(service, EnginePhase.SPAWNING_DAEMON)
+            self.assertEqual(retry_snapshot.state, EngineState.STARTING)
+            self.assertEqual(retry_snapshot.progress, 0.2)
+
+            ready_event.set()
+            ready_snapshot = self._wait_for_engine_state(service, EngineState.READY)
+            self.assertEqual(ready_snapshot.phase, EnginePhase.READY)
+        finally:
+            service.close()
 
     def test_first_job_starts_engine_and_second_reuses_it(self) -> None:
         spawn_count = 0
@@ -380,6 +534,38 @@ class VideoEditServiceTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "BBOX_OUT_OF_RANGE")
         finally:
             service.close()
+
+    def test_close_stops_daemon_process_group(self) -> None:
+        process = FakeDaemonProcess()
+        popen_kwargs: dict[str, object] = {}
+
+        def fake_popen(*args, **kwargs):
+            popen_kwargs.update(kwargs)
+            return process
+
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=fake_popen,
+            socket_probe=lambda _socket_path: False,
+            job_executor=lambda _job: None,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=10.0,
+        )
+        try:
+            with mock.patch("video_edit_service.os.getpgid", return_value=54321), mock.patch(
+                "video_edit_service.os.killpg"
+            ) as killpg:
+                service.request_model_load()
+                service.close()
+
+            self.assertTrue(popen_kwargs["start_new_session"])
+            killpg.assert_called_once()
+            sig = killpg.call_args.args[1]
+            self.assertEqual(sig, __import__("signal").SIGTERM)
+        finally:
+            if not service._closed:
+                service.close()
 
 
 if __name__ == "__main__":
