@@ -31,7 +31,7 @@ JOB_RUNNER_MARKER="run_edit_video.py"
 mkdir -p "$LOG_DIR"
 
 timestamp() {
-  date -u +"%Y-%m-%dT%H:%M:%SZ"
+  date +"%Y-%m-%d %H:%M:%S"
 }
 
 log() {
