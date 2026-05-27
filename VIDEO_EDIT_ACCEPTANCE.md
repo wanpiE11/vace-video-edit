@@ -214,6 +214,72 @@ pkill -9 -f "python -m uvicorn video_edit_api:app"
 - 强制终止会直接打断当前推理中的任务。
 - 当前服务没有“取消单个任务”接口；停掉 API 会影响当前内存里的全部任务，并中断它所管理的 engine。
 
+### 4.7 自动健康检查和重启
+
+如果希望 API 服务异常退出或健康检查失败后自动恢复，可以使用仓库内的 watchdog 脚本：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+chmod +x watch_video_edit_api.sh
+
+tmux new -s vace-api-watchdog
+./watch_video_edit_api.sh
+```
+
+只退出 `tmux` 会话但保持 watchdog 继续运行：
+
+```bash
+Ctrl+b d
+```
+
+watchdog 默认行为：
+
+- 启动并管理 `python -m uvicorn video_edit_api:app --host 0.0.0.0 --port 8880`
+- 如果该 API 已经在运行，会先接管已有进程，不重复启动
+- API 启动或重启后，等待 `/healthz` 可用，然后自动调用 `/api/v1/video-editing/engine/load` 触发模型加载
+- 每 `30` 秒请求一次 `http://127.0.0.1:8880/healthz`
+- 连续 `2` 次健康检查失败后重启 API
+- `/healthz` 返回 `engine_state=failed` 时也会触发重启
+- 重启时先发送 `SIGTERM`，等待 `30` 秒后仍未退出再发送 `SIGKILL`
+
+watchdog 日志：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+tail -f logs/video_edit_watchdog.log
+```
+
+watchdog 启动的 API stdout/stderr：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+tail -f logs/video_edit_api_watchdog_service.log
+```
+
+重新进入 watchdog 会话：
+
+```bash
+tmux attach -t vace-api-watchdog
+```
+
+停止 watchdog：
+
+```bash
+tmux kill-session -t vace-api-watchdog
+```
+
+说明：
+
+- watchdog 停止后，不会主动停止已经启动的 API 进程。
+- 如需关闭自动模型加载，可设置 `AUTO_LOAD_ENGINE_AFTER_START=0`。
+- 如果希望停止 API，仍按第 4.6 节使用 `Ctrl+C`、`tmux kill-session -t vace-api` 或 `pkill -f "python -m uvicorn video_edit_api:app"`。
+- 重启 API 会中断当前正在推理的任务，并丢失 API 进程内存中的任务状态。
+- 可通过环境变量调整配置，例如：
+
+```bash
+CHECK_INTERVAL_SECONDS=10 MAX_CONSECUTIVE_FAILURES=3 AUTO_LOAD_ENGINE_AFTER_START=1 ./watch_video_edit_api.sh
+```
+
 ## 5. 调用说明
 
 完整接口字段、状态码和错误码定义，以 [`VideoEditAPI.md`](/root/data/gzn/vace-video-edit/VideoEditAPI.md) 为准。
