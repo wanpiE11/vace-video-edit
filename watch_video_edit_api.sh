@@ -15,6 +15,9 @@ RESTART_ON_ENGINE_FAILED="${RESTART_ON_ENGINE_FAILED:-1}"
 RESTART_GRACE_SECONDS="${RESTART_GRACE_SECONDS:-30}"
 AUTO_LOAD_ENGINE_AFTER_START="${AUTO_LOAD_ENGINE_AFTER_START:-1}"
 API_STARTUP_TIMEOUT_SECONDS="${API_STARTUP_TIMEOUT_SECONDS:-60}"
+DEEP_CLEANUP_ON_RESTART="${DEEP_CLEANUP_ON_RESTART:-1}"
+ENGINE_SOCKET_PATH="${ENGINE_SOCKET_PATH:-/tmp/vace_wan_infer.sock}"
+DEEP_CLEANUP_GRACE_SECONDS="${DEEP_CLEANUP_GRACE_SECONDS:-20}"
 
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 PID_FILE="${PID_FILE:-$LOG_DIR/video_edit_api.pid}"
@@ -22,6 +25,8 @@ WATCHDOG_LOG="${WATCHDOG_LOG:-$LOG_DIR/video_edit_watchdog.log}"
 SERVICE_LOG="${SERVICE_LOG:-$LOG_DIR/video_edit_api_watchdog_service.log}"
 
 PROCESS_MARKER="python -m uvicorn video_edit_api:app"
+ENGINE_MARKER="run_edit_video_server.py"
+JOB_RUNNER_MARKER="run_edit_video.py"
 
 mkdir -p "$LOG_DIR"
 
@@ -239,6 +244,116 @@ stop_api() {
   fi
 }
 
+log_gpu_processes() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    log "gpu process check skipped: nvidia-smi not found"
+    return 0
+  fi
+
+  log "gpu process snapshot begin"
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>&1 \
+    | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        log "gpu process $line"
+      done
+  log "gpu process snapshot end"
+}
+
+find_processes_by_markers() {
+  local first_marker="$1"
+  local second_marker="${2:-}"
+
+  ps -eo pid=,args= \
+    | awk -v first="$first_marker" -v second="$second_marker" \
+        'index($0, first) && (second == "" || index($0, second)) && !index($0, "awk -v first=") { print $1 }'
+}
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local deadline=$((SECONDS + DEEP_CLEANUP_GRACE_SECONDS))
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+
+  return 0
+}
+
+terminate_process_group_or_pid() {
+  local pid="$1"
+  local label="$2"
+  local pgid
+  local self_pgid
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  self_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+
+  if [[ -n "$pgid" && "$pgid" != "$self_pgid" ]]; then
+    log "deep cleanup stopping $label pid=$pid pgid=$pgid signal=TERM"
+    kill -TERM "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  else
+    log "deep cleanup stopping $label pid=$pid signal=TERM"
+    kill "$pid" 2>/dev/null || true
+  fi
+
+  if wait_for_pid_exit "$pid"; then
+    return 0
+  fi
+
+  if [[ -n "$pgid" && "$pgid" != "$self_pgid" ]]; then
+    log "deep cleanup force killing $label pid=$pid pgid=$pgid signal=KILL"
+    kill -KILL "-$pgid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+  else
+    log "deep cleanup force killing $label pid=$pid signal=KILL"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+}
+
+cleanup_matching_processes() {
+  local label="$1"
+  local first_marker="$2"
+  local second_marker="$3"
+  local pid
+  local found=0
+
+  while read -r pid; do
+    [[ -z "$pid" ]] && continue
+    terminate_process_group_or_pid "$pid" "$label"
+    found=1
+  done < <(find_processes_by_markers "$first_marker" "$second_marker")
+
+  if (( found == 0 )); then
+    log "deep cleanup found no $label processes"
+  fi
+}
+
+deep_cleanup_runtime() {
+  if [[ "$DEEP_CLEANUP_ON_RESTART" != "1" ]]; then
+    log "deep cleanup skipped deep_cleanup_on_restart=$DEEP_CLEANUP_ON_RESTART"
+    return 0
+  fi
+
+  log "deep cleanup starting socket_path=$ENGINE_SOCKET_PATH"
+  log_gpu_processes
+  cleanup_matching_processes "engine daemon" "$ENGINE_MARKER" "--socket-path $ENGINE_SOCKET_PATH"
+  cleanup_matching_processes "job runner" "$JOB_RUNNER_MARKER" "--server-socket $ENGINE_SOCKET_PATH"
+
+  if [[ -S "$ENGINE_SOCKET_PATH" || -e "$ENGINE_SOCKET_PATH" ]]; then
+    rm -f "$ENGINE_SOCKET_PATH"
+    log "deep cleanup removed socket_path=$ENGINE_SOCKET_PATH"
+  fi
+
+  log_gpu_processes
+  log "deep cleanup finished"
+}
+
 health_check() {
   local body
   local status
@@ -283,6 +398,7 @@ restart_api() {
 
   log "restarting api reason=$reason"
   stop_api
+  deep_cleanup_runtime
   start_api
 }
 

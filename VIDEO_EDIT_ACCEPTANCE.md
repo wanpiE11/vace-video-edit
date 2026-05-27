@@ -241,6 +241,7 @@ watchdog 默认行为：
 - 连续 `2` 次健康检查失败后重启 API
 - `/healthz` 返回 `engine_state=failed` 时也会触发重启
 - 重启时先发送 `SIGTERM`，等待 `30` 秒后仍未退出再发送 `SIGKILL`
+- 重启前会执行深度清理：清理关联的 engine daemon、job runner、`/tmp/vace_wan_infer.sock`，并记录重启前后的 `nvidia-smi` 计算进程快照
 
 watchdog 日志：
 
@@ -272,12 +273,14 @@ tmux kill-session -t vace-api-watchdog
 
 - watchdog 停止后，不会主动停止已经启动的 API 进程。
 - 如需关闭自动模型加载，可设置 `AUTO_LOAD_ENGINE_AFTER_START=0`。
+- 如需关闭重启前深度清理，可设置 `DEEP_CLEANUP_ON_RESTART=0`。
 - 如果希望停止 API，仍按第 4.6 节使用 `Ctrl+C`、`tmux kill-session -t vace-api` 或 `pkill -f "python -m uvicorn video_edit_api:app"`。
 - 重启 API 会中断当前正在推理的任务，并丢失 API 进程内存中的任务状态。
+- 深度清理会尽量释放本服务占用的 GPU 资源；如果 `nvidia-smi` 仍显示无关进程占用显存，需要人工确认后再处理，watchdog 不会杀掉无法识别为本服务的 GPU 进程。
 - 可通过环境变量调整配置，例如：
 
 ```bash
-CHECK_INTERVAL_SECONDS=10 MAX_CONSECUTIVE_FAILURES=3 AUTO_LOAD_ENGINE_AFTER_START=1 ./watch_video_edit_api.sh
+CHECK_INTERVAL_SECONDS=10 MAX_CONSECUTIVE_FAILURES=3 AUTO_LOAD_ENGINE_AFTER_START=1 DEEP_CLEANUP_ON_RESTART=1 ./watch_video_edit_api.sh
 ```
 
 ## 5. 调用说明
