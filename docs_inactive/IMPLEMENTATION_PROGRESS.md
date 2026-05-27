@@ -160,7 +160,7 @@ python -m py_compile video_edit_service.py tests/test_video_edit_service.py
 
 - [video_edit_service.py](/root/data/gzn/vace-video-edit/video_edit_service.py)
 - [tests/test_video_edit_service.py](/root/data/gzn/vace-video-edit/tests/test_video_edit_service.py)
-- [IMPLEMENTATION_PROGRESS.md](/root/data/gzn/vace-video-edit/IMPLEMENTATION_PROGRESS.md)
+- [IMPLEMENTATION_PROGRESS.md](/root/data/gzn/vace-video-edit/docs_inactive/IMPLEMENTATION_PROGRESS.md)
 
 ## Existing Local Change Not Touched
 

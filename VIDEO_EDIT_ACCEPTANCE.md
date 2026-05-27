@@ -4,7 +4,7 @@
 
 - 对外接口契约文档：[`VideoEditAPI.md`](/root/data/gzn/vace-video-edit/VideoEditAPI.md)
 - 四卡常驻 engine 启动说明：[`four_gpu_vace_command.md`](/root/data/gzn/vace-video-edit/four_gpu_vace_command.md)
-- 单次命令行运行说明：[`RUN_EDIT_VIDEO.md`](/root/data/gzn/vace-video-edit/RUN_EDIT_VIDEO.md)
+- 单次命令行运行说明：[`RUN_EDIT_VIDEO.md`](/root/data/gzn/vace-video-edit/docs_inactive/RUN_EDIT_VIDEO.md)
 
 `VideoEditAPI.md` 仍然是正式接口文档；本文档是交付、启动、联调和验收说明，不替代接口契约。
 
@@ -392,7 +392,96 @@ curl --noproxy '*' -OJ \
 - `video_path` 和 `reference_image_path` 必须是绝对路径
 - `output_name` 只能是文件名，不能带目录
 
-## 8. 验收标准
+## 8. 日志与排障
+
+服务启动和任务执行后，会在服务器本地写日志。当前不通过 HTTP 接口暴露日志，避免泄露内部路径、命令行和 traceback。
+
+### 8.1 日志位置
+
+- API 和 service 主日志：`/root/data/gzn/vace-video-edit/logs/video_edit_api.log`
+- engine daemon 日志：`/root/data/gzn/vace-video-edit/logs/video_edit_engine.log`
+- 单任务日志：`/root/data/gzn/vace-video-edit/workspace/jobs/<job_id>/logs/job.log`
+
+说明：
+
+- `video_edit_api.log` 按大小轮转，单文件约 `50MB`，保留 `5` 个备份。
+- `video_edit_engine.log` 记录常驻 engine 的 stdout/stderr。
+- `job.log` 记录单个任务的状态、执行命令、`run_edit_video.py` 完整 stdout/stderr、成功输出或失败 traceback。
+
+### 8.2 常用查看命令
+
+查看 API/service 主日志：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+tail -f logs/video_edit_api.log
+```
+
+查看 engine daemon 日志：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+tail -f logs/video_edit_engine.log
+```
+
+查看单个任务日志：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+tail -f workspace/jobs/<job_id>/logs/job.log
+```
+
+按 `job_id` 回查主日志：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+grep "<job_id>" logs/video_edit_api.log
+```
+
+查看最近错误：
+
+```bash
+cd /root/data/gzn/vace-video-edit
+grep -E "ERROR|WARNING|failed|traceback" logs/video_edit_api.log
+```
+
+### 8.3 排障顺序
+
+如果 `POST /jobs` 直接失败：
+
+- 先看 HTTP 响应里的 `error.code`
+- 再看 `logs/video_edit_api.log`
+- 常见原因是参数校验、文件路径不存在、bbox 超出视频尺寸
+
+如果 engine 长时间停在 `starting`：
+
+- 先看 `GET /api/v1/video-editing/engine` 的 `phase`、`progress`、`last_error`
+- 再看 `logs/video_edit_engine.log`
+- 常见原因是模型目录错误、GPU 资源不足、daemon 启动失败、socket 长时间没有 ready
+
+如果任务状态变成 `failed`：
+
+- 先看 `GET /api/v1/video-editing/jobs/<job_id>` 的 `error.code` 和 `error.message`
+- 再看 `workspace/jobs/<job_id>/logs/job.log`
+- 最后用 `grep "<job_id>" logs/video_edit_api.log` 回查 service 状态变化
+
+如果 `/results` 成功但下载失败：
+
+- 确认任务状态已经是 `done`
+- 查看 `/results` 返回的 `output.output_video_path`
+- 检查该文件是否存在、是否非空
+- 回查 `workspace/jobs/<job_id>/logs/job.log` 中的输出路径和 `run_edit_video.py` stdout/stderr
+
+### 8.4 常见错误码对应日志
+
+- `INVALID_ARGUMENT`：看 `video_edit_api.log`，重点检查请求字段、路径是否绝对路径、`output_name` 是否只是文件名。
+- `BBOX_OUT_OF_RANGE`：看 `video_edit_api.log`，重点检查 bbox 是否超过输入视频宽高。
+- `FILE_NOT_FOUND`：看 `video_edit_api.log`，重点检查 `video_path` 或 `reference_image_path` 是否存在。
+- `ENGINE_START_FAILED`：看 `video_edit_engine.log`，重点检查模型加载、GPU、daemon 进程和 socket。
+- `ENGINE_EXECUTION_FAILED`：看 `workspace/jobs/<job_id>/logs/job.log`，重点检查预处理、socket 调用、推理输出和结果解析。
+- `OUTPUT_NOT_AVAILABLE`：看任务状态和 `job.log`，重点确认任务是否完成、输出路径是否生成、文件是否被删除。
+
+## 9. 验收标准
 
 测试同事联调通过后，可认为模块达到前端合入条件的最低标准：
 
@@ -403,8 +492,9 @@ curl --noproxy '*' -OJ \
 5. `GET /jobs/{job_id}/results` 在未完成时返回 `409`，完成后返回 `200`
 6. `GET /jobs/{job_id}/output/download` 能下载非空 mp4
 7. 前端能基于 `job_id` 完成一次完整任务链路展示
+8. 出现失败时，能按第 8 节日志说明定位到 API 参数、engine 启动或单任务执行问题
 
-## 9. 已知限制
+## 10. 已知限制
 
 当前版本存在以下限制，交付时应明确给测试和前端：
 
@@ -413,7 +503,7 @@ curl --noproxy '*' -OJ \
 - 首次模型加载很慢，建议先调用 `/api/v1/video-editing/engine/load`，待 `ready` 后再提任务
 - 四卡推理对 GPU 资源要求高，联调期间不建议与其他重任务混跑
 
-## 10. 文档使用方式
+## 11. 文档使用方式
 
 建议团队内按下面方式使用文档：
 
@@ -424,4 +514,4 @@ curl --noproxy '*' -OJ \
 - `four_gpu_vace_command.md`
   作为底层 engine 启动与排障参考，不是默认联调主流程
 
-如果测试同事完成本文档第 8 节中的验收项，就可以通知前端按 `VideoEditAPI.md` 的接口契约合入。 
+如果测试同事完成本文档第 9 节中的验收项，就可以通知前端按 `VideoEditAPI.md` 的接口契约合入。

@@ -5,6 +5,7 @@ import ast
 import json
 import os
 import queue
+import shlex
 import signal
 import socket
 import subprocess
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Callable
 
 import cv2
+
+from video_edit_logging import configure_logging, get_logger, log_context
 
 
 DEFAULT_SOCKET_PATH = "/tmp/vace_wan_infer.sock"
@@ -204,6 +207,8 @@ class VideoEditService:
         self.socket_probe = socket_probe or self._probe_socket
         self.job_executor = job_executor or self._execute_job
         self.video_info_getter = video_info_getter or self._get_video_dimensions
+        configure_logging(self.repo_root)
+        self._logger = get_logger("service")
 
         self._jobs: dict[str, JobRecord] = {}
         self._job_request_signatures: dict[str, str] = {}
@@ -225,6 +230,7 @@ class VideoEditService:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._worker_thread = threading.Thread(target=self._worker_loop, name="video-edit-worker", daemon=True)
         self._worker_thread.start()
+        self._logger.info("video edit service started workspace_root=%s socket_path=%s", self.workspace_root, self.socket_path)
 
     def submit_job(self, payload: dict[str, object]) -> SubmitJobResult:
         normalized_input = self._validate_payload(payload)
@@ -238,10 +244,21 @@ class VideoEditService:
                 if existing_job_id is not None:
                     existing_job = self._jobs[existing_job_id]
                     if self._build_request_signature(existing_job.input) != request_signature:
+                        self._logger.warning(
+                            "client_request_id conflict client_request_id=%s existing_job_id=%s",
+                            client_request_id,
+                            existing_job_id,
+                        )
                         raise VideoEditServiceError(
                             "INVALID_ARGUMENT",
                             "client_request_id is already bound to a different request.",
                             status_code=409,
+                        )
+                    with log_context(job_id=existing_job.job_id):
+                        self._logger.info(
+                            "job deduplicated client_request_id=%s queue_position=%s",
+                            client_request_id,
+                            self._get_queue_position_unlocked(existing_job.job_id),
                         )
                     return SubmitJobResult(
                         job_id=existing_job.job_id,
@@ -265,6 +282,13 @@ class VideoEditService:
             self._pending_job_ids.append(job_id)
             if isinstance(client_request_id, str) and client_request_id:
                 self._job_request_signatures[client_request_id] = job_id
+            with log_context(job_id=job_id):
+                self._logger.info(
+                    "job submitted queue_position=%s engine_state=%s input=%s",
+                    self._get_queue_position_unlocked(job_id),
+                    self._engine_state,
+                    self._safe_json(self._sanitize_job_input(normalized_input)),
+                )
 
         self.request_model_load()
         self._queue.put(job_id)
@@ -318,11 +342,18 @@ class VideoEditService:
             generation = self._startup_generation
             self._condition.notify_all()
             spawn_daemon = True
+            self._logger.info(
+                "engine load requested generation=%s model_name=%s ckpt_dir=%s",
+                generation,
+                self.model_name,
+                self.ckpt_dir,
+            )
 
         if spawn_daemon:
             try:
                 process, log_handle, log_path, log_offset = self._spawn_daemon_process()
             except Exception as exc:
+                self._logger.exception("engine daemon spawn failed")
                 self._set_engine_failed(
                     code="ENGINE_START_FAILED",
                     message=f"Failed to spawn resident daemon: {exc}",
@@ -374,9 +405,11 @@ class VideoEditService:
                 return
             self._closed = True
             self._condition.notify_all()
+        self._logger.info("video edit service closing")
         self._queue.put(None)
         self._worker_thread.join(timeout=5.0)
         self._stop_daemon_process()
+        self._logger.info("video edit service closed")
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -408,6 +441,7 @@ class VideoEditService:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        self._logger.info("spawning engine daemon log_path=%s command=%s", log_path, self._quote_command(cmd))
         process = self.daemon_popen_factory(
             cmd,
             cwd=str(self.repo_root),
@@ -434,6 +468,7 @@ class VideoEditService:
 
             return_code = process.poll()
             if return_code is not None:
+                self._logger.error("engine daemon exited before ready return_code=%s", return_code)
                 self._set_engine_failed(
                     code="ENGINE_START_FAILED",
                     message=f"Resident daemon exited before ready with code {return_code}.",
@@ -450,6 +485,7 @@ class VideoEditService:
                         self._engine_ready_at = self._utc_now()
                         self._engine_error = None
                         self._condition.notify_all()
+                        self._logger.info("engine ready socket_path=%s generation=%s", self.socket_path, generation)
                 return
 
             time.sleep(self.poll_interval_seconds)
@@ -466,6 +502,7 @@ class VideoEditService:
             self._engine_phase = EnginePhase.FAILED
             self._engine_error = JobError(code=code, message=message, traceback=trace)
             self._condition.notify_all()
+        self._logger.error("engine failed code=%s message=%s trace=%s", code, message, trace)
         self._stop_daemon_process()
 
     def _watch_engine_logs(self, generation: int, log_path: Path, offset: int) -> None:
@@ -490,6 +527,7 @@ class VideoEditService:
                     self._engine_phase = EnginePhase.MODEL_INITIALIZED
                     self._engine_progress = 0.8
                     self._condition.notify_all()
+                self._logger.info("engine model initialized generation=%s log_path=%s", generation, log_path)
                 return
 
     def _worker_loop(self) -> None:
@@ -509,6 +547,8 @@ class VideoEditService:
             try:
                 result = self.job_executor(job)
             except Exception as exc:
+                with log_context(job_id=job.job_id):
+                    self._logger.exception("job execution failed")
                 self._mark_job_failed(
                     job,
                     code="ENGINE_EXECUTION_FAILED",
@@ -530,6 +570,7 @@ class VideoEditService:
                             message="Resident daemon is no longer running.",
                             traceback="Resident daemon exited after job execution.",
                         )
+                        self._logger.error("engine daemon is no longer running after job execution")
                     self._condition.notify_all()
 
     def _wait_until_engine_ready(self, job: JobRecord) -> bool:
@@ -573,6 +614,9 @@ class VideoEditService:
             self._engine_phase = EnginePhase.RUNNING_JOB
             self._engine_progress = 1.0
             self._condition.notify_all()
+        self._append_job_log(job, "Job started.")
+        with log_context(job_id=job.job_id):
+            self._logger.info("job running input=%s", self._safe_json(self._sanitize_job_input(job.input)))
 
     def _mark_job_done(self, job: JobRecord, result: JobExecutionResult) -> None:
         with self._condition:
@@ -589,6 +633,14 @@ class VideoEditService:
             )
             job.error = None
             self._condition.notify_all()
+        self._append_job_log(job, f"Job completed. output_video_path={result.output_video_path}")
+        with log_context(job_id=job.job_id):
+            self._logger.info(
+                "job done output_dir=%s output_video_path=%s src_video_path=%s",
+                result.output_dir,
+                result.output_video_path,
+                result.src_video_path,
+            )
 
     def _mark_job_failed(self, job: JobRecord, code: str, message: str, trace: str) -> None:
         with self._condition:
@@ -600,6 +652,9 @@ class VideoEditService:
             self._remove_pending_job_unlocked(job.job_id)
             job.error = JobError(code=code, message=message, traceback=trace)
             self._condition.notify_all()
+        self._append_job_log(job, f"Job failed. code={code} message={message}\n{trace}")
+        with log_context(job_id=job.job_id):
+            self._logger.error("job failed code=%s message=%s trace=%s", code, message, trace)
 
     def _get_job_ref(self, job_id: str) -> JobRecord | None:
         with self._condition:
@@ -659,6 +714,7 @@ class VideoEditService:
         if fps is not None:
             cmd.extend(["--save_fps", str(fps)])
 
+        self._append_job_log(job, "Running command:\n" + self._quote_command(cmd))
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         completed = subprocess.run(
@@ -669,6 +725,7 @@ class VideoEditService:
             capture_output=True,
             check=False,
         )
+        self._append_job_process_output(job, completed)
         if completed.returncode != 0:
             raise RuntimeError(self._build_process_failure_message(completed))
 
@@ -694,6 +751,20 @@ class VideoEditService:
         if completed.stderr:
             parts.append(f"stderr: {completed.stderr.strip()[-4000:]}")
         return "\n".join(parts)
+
+    def _append_job_process_output(self, job: JobRecord, completed: subprocess.CompletedProcess) -> None:
+        self._append_job_log(
+            job,
+            "\n".join(
+                [
+                    f"run_edit_video.py exited with code {completed.returncode}.",
+                    "--- stdout ---",
+                    completed.stdout or "",
+                    "--- stderr ---",
+                    completed.stderr or "",
+                ]
+            ),
+        )
 
     def _parse_resident_result(self, stdout: str) -> dict[str, object]:
         for line in reversed(stdout.splitlines()):
@@ -924,6 +995,28 @@ class VideoEditService:
 
     def _optional_str(self, value: object) -> str | None:
         return value if isinstance(value, str) and value else None
+
+    def _job_log_path(self, job: JobRecord) -> Path:
+        return self.workspace_root / job.job_id / "logs" / "job.log"
+
+    def _append_job_log(self, job: JobRecord, message: str) -> None:
+        path = self._job_log_path(job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"[{self._utc_now()}] {message.rstrip()}\n")
+
+    def _sanitize_job_input(self, payload: dict[str, object]) -> dict[str, object]:
+        sanitized = dict(payload)
+        prompt = sanitized.get("prompt")
+        if isinstance(prompt, str) and len(prompt) > 200:
+            sanitized["prompt"] = prompt[:200] + "...<truncated>"
+        return sanitized
+
+    def _safe_json(self, value: object) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _quote_command(self, cmd: list[str]) -> str:
+        return " ".join(shlex.quote(part) for part in cmd)
 
 
 _default_service_lock = threading.Lock()

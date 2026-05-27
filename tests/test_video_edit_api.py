@@ -139,6 +139,23 @@ class VideoEditApiTests(unittest.TestCase):
             block.set()
             service.close()
 
+    def test_api_request_logging_writes_rotating_log_file(self) -> None:
+        service = self._make_service()
+        try:
+            app = create_app(service=service)
+            with TestClient(app) as client:
+                response = client.get("/healthz")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("X-Request-ID", response.headers)
+
+            log_path = self.root / "logs" / "video_edit_api.log"
+            self.assertTrue(log_path.exists())
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("request started method=GET path=/healthz", log_text)
+            self.assertIn("request completed method=GET path=/healthz status_code=200", log_text)
+        finally:
+            service.close()
+
     def test_engine_load_endpoint_is_idempotent(self) -> None:
         ready_event = threading.Event()
 

@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import time
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,6 +13,7 @@ from video_edit_service import (
     EnginePhase,
     EngineState,
     JobExecutionResult,
+    JobRecord,
     JobStatus,
     VideoEditService,
     VideoEditServiceError,
@@ -352,6 +354,11 @@ class VideoEditServiceTests(unittest.TestCase):
             self.assertIsNotNone(job.output.out_video_path)
             self.assertEqual(job.output.out_video_path, job.output.output_video_path)
             self.assertTrue(job.output.out_video_path.endswith("edited.mp4"))
+            job_log = self.root / "jobs" / result.job_id / "logs" / "job.log"
+            self.assertTrue(job_log.exists())
+            log_text = job_log.read_text(encoding="utf-8")
+            self.assertIn("Job started.", log_text)
+            self.assertIn("Job completed. output_video_path=", log_text)
         finally:
             service.close()
 
@@ -386,6 +393,12 @@ class VideoEditServiceTests(unittest.TestCase):
             self.assertEqual(job.progress, 1.0)
             self.assertIn("intentional failure", job.error.message)
             self.assertIn("RuntimeError", job.error.traceback)
+            job_log = self.root / "jobs" / result.job_id / "logs" / "job.log"
+            self.assertTrue(job_log.exists())
+            log_text = job_log.read_text(encoding="utf-8")
+            self.assertIn("Job started.", log_text)
+            self.assertIn("Job failed. code=ENGINE_EXECUTION_FAILED", log_text)
+            self.assertIn("intentional failure", log_text)
         finally:
             service.close()
 
@@ -532,6 +545,43 @@ class VideoEditServiceTests(unittest.TestCase):
             with self.assertRaises(VideoEditServiceError) as ctx:
                 service.submit_job(self._payload() | {"bbox": [0, 0, 1000, 1000]})
             self.assertEqual(ctx.exception.code, "BBOX_OUT_OF_RANGE")
+        finally:
+            service.close()
+
+    def test_execute_job_writes_process_output_to_job_log(self) -> None:
+        service = VideoEditService(
+            repo_root=self.root,
+            workspace_root=self.root / "jobs",
+            daemon_popen_factory=lambda *args, **kwargs: FakeDaemonProcess(),
+            socket_probe=lambda _socket_path: True,
+            poll_interval_seconds=0.01,
+            startup_timeout_seconds=1.0,
+        )
+        try:
+            job = JobRecord(
+                job_id="edit_job_logtest",
+                status=JobStatus.RUNNING,
+                progress=0.5,
+                created_at=service._utc_now(),
+                engine_state_at_submit=EngineState.READY,
+                input=self._payload(),
+            )
+            stdout = (
+                "preprocess ok\n"
+                "Resident service result: {'out_video': '/tmp/out.mp4', 'src_video': '/tmp/src.mp4'}\n"
+            )
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="runtime warning\n")
+
+            with mock.patch("video_edit_service.subprocess.run", return_value=completed):
+                result = service._execute_job(job)
+
+            self.assertEqual(result.out_video_path, "/tmp/out.mp4")
+            job_log = self.root / "jobs" / job.job_id / "logs" / "job.log"
+            log_text = job_log.read_text(encoding="utf-8")
+            self.assertIn("Running command:", log_text)
+            self.assertIn("run_edit_video.py exited with code 0.", log_text)
+            self.assertIn("preprocess ok", log_text)
+            self.assertIn("runtime warning", log_text)
         finally:
             service.close()
 
